@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Keyframe Video Downloader",
+  "version": "1.0",
+  "description": "Download all videos from Keyframe Gallery",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://stream.mux.com/*",
+    "https://*.fastly.mux.com/*",
+    "https://*.cfcdn.mux.com/*",
+    "https://*.mux.com/*",
+    "https://www.keyframe.gallery/*",
+    "https://keyframe.gallery/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://keyframe.gallery/*",
+        "https://www.keyframe.gallery/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

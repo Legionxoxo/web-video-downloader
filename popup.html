@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 400px;
+      max-height: 500px;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: #111;
+      color: #eee;
+      overflow-y: auto;
+    }
+
+    .header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: linear-gradient(135deg, #1a1a2e, #16213e);
+      padding: 16px;
+      border-bottom: 1px solid #333;
+    }
+
+    .header h1 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .header h1 span {
+      color: #FAC800;
+    }
+
+    .stats {
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 10px;
+    }
+
+    .btn-download-all {
+      width: 100%;
+      padding: 10px;
+      background: #FAC800;
+      color: #111;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .btn-download-all:hover {
+      background: #e0b400;
+    }
+
+    .btn-download-all:disabled {
+      background: #555;
+      color: #999;
+      cursor: not-allowed;
+    }
+
+    .video-list {
+      padding: 8px;
+    }
+
+    .video-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px;
+      border-radius: 8px;
+      transition: background 0.15s;
+      cursor: default;
+    }
+
+    .video-item:hover {
+      background: #1a1a1a;
+    }
+
+    .video-thumb {
+      width: 80px;
+      height: 45px;
+      border-radius: 4px;
+      object-fit: cover;
+      flex-shrink: 0;
+      background: #222;
+    }
+
+    .video-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .video-title {
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 2px;
+    }
+
+    .video-company {
+      font-size: 11px;
+      color: #888;
+    }
+
+    .btn-download {
+      flex-shrink: 0;
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      border: 1px solid #333;
+      background: transparent;
+      color: #FAC800;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s;
+    }
+
+    .btn-download:hover {
+      background: #FAC800;
+      color: #111;
+      border-color: #FAC800;
+    }
+
+    .btn-download svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: #888;
+      font-size: 13px;
+    }
+
+    .loading .spinner {
+      border: 2px solid #333;
+      border-top-color: #FAC800;
+      border-radius: 50%;
+      width: 24px;
+      height: 24px;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 12px;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .empty {
+      text-align: center;
+      padding: 40px 20px;
+      color: #666;
+      font-size: 13px;
+    }
+
+    .status-bar {
+      position: sticky;
+      bottom: 0;
+      background: #1a1a1a;
+      padding: 8px 16px;
+      font-size: 11px;
+      color: #FAC800;
+      text-align: center;
+      border-top: 1px solid #333;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>⬇ <span>Keyframe</span> Downloader</h1>
+    <div class="stats" id="stats">Scanning page...</div>
+    <button class="btn-download-all" id="downloadAll" disabled>Download All Videos</button>
+  </div>
+
+  <div id="content">
+    <div class="loading">
+      <div class="spinner"></div>
+      Scanning for videos...
+    </div>
+  </div>
+
+  <div class="status-bar" id="statusBar"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
