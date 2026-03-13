@@ -184,9 +184,12 @@
 </head>
 <body>
   <div class="header">
-    <h1>⬇ <span>Keyframe</span> Downloader</h1>
+    <h1>⬇ <span>Mux Video</span> Downloader</h1>
     <div class="stats" id="stats">Scanning page...</div>
-    <button class="btn-download-all" id="downloadAll" disabled>Download All Videos</button>
+    <div style="display: flex; gap: 8px; margin-top: 8px;">
+      <button class="btn-download-all" id="downloadAll" disabled>Download All</button>
+      <button class="btn-download-all" id="autoScroll" style="background:#444; color:#eee;">Scroll & Find More</button>
+    </div>
   </div>
 
   <div id="content">

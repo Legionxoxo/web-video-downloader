@@ -1,5 +1,21 @@
 // Background service worker: downloads Mux videos by parsing HLS manifests
 
+// Save large buffers to IndexedDB to avoid the 64MiB message size limit
+function idbPut(id, buffer) {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('MuxDownloaderDB', 1);
+    request.onupgradeneeded = e => e.target.result.createObjectStore('blobs');
+    request.onsuccess = e => {
+      const db = e.target.result;
+      const tx = db.transaction('blobs', 'readwrite');
+      const putReq = tx.objectStore('blobs').put(buffer, id);
+      putReq.onsuccess = () => resolve();
+      putReq.onerror = () => reject(tx.error);
+    };
+    request.onerror = e => reject(request.error);
+  });
+}
+
 // Ensure the offscreen document exists (for blob URL creation)
 let creatingOffscreen = null;
 async function ensureOffscreenDocument() {
@@ -25,26 +41,49 @@ async function ensureOffscreenDocument() {
 function parseMasterPlaylist(m3u8Text, baseUrl) {
   const lines = m3u8Text.split('\n');
   let bestBandwidth = 0;
-  let bestUrl = null;
+  let videoUrl = null;
+  let audioGroupId = null;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (line.startsWith('#EXT-X-STREAM-INF:')) {
       const bwMatch = line.match(/BANDWIDTH=(\d+)/);
       const bandwidth = bwMatch ? parseInt(bwMatch[1]) : 0;
+      
+      const audioMatch = line.match(/AUDIO="([^"]+)"/);
+      const currentAudioGroup = audioMatch ? audioMatch[1] : null;
+
       for (let j = i + 1; j < lines.length; j++) {
         const urlLine = lines[j].trim();
         if (urlLine && !urlLine.startsWith('#')) {
           if (bandwidth > bestBandwidth) {
             bestBandwidth = bandwidth;
-            bestUrl = urlLine.startsWith('http') ? urlLine : new URL(urlLine, baseUrl).href;
+            videoUrl = urlLine.startsWith('http') ? urlLine : new URL(urlLine, baseUrl).href;
+            audioGroupId = currentAudioGroup;
           }
           break;
         }
       }
     }
   }
-  return bestUrl;
+
+  let audioUrl = null;
+  if (audioGroupId) {
+    // Find the audio track matching this group
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line.startsWith('#EXT-X-MEDIA:TYPE=AUDIO') && line.includes(`GROUP-ID="${audioGroupId}"`)) {
+        const uriMatch = line.match(/URI="([^"]+)"/);
+        if (uriMatch) {
+           const uri = uriMatch[1];
+           audioUrl = uri.startsWith('http') ? uri : new URL(uri, baseUrl).href;
+           break;
+        }
+      }
+    }
+  }
+
+  return { videoUrl, audioUrl };
 }
 
 // Parse a rendition m3u8 and return init segment URL + media segment URLs
@@ -68,174 +107,224 @@ function parseRenditionPlaylist(m3u8Text, baseUrl) {
   return { initUrl, segments };
 }
 
+// Test if native MP4 download is available for this video
+async function tryDirectMp4(playbackId, sendProgress) {
+  sendProgress('Checking native MP4 availability...');
+  const url = `https://stream.mux.com/${playbackId}/high.mp4`;
+  try {
+    const res = await fetch(url, { method: 'HEAD' });
+    if (res.ok) {
+      return { type: 'direct', url, ext: '.mp4', mimeType: 'video/mp4' };
+    }
+  } catch (e) {
+    // Ignore, fallback to HLS
+  }
+  return null;
+}
+
 // Fetch and assemble a video, return as Uint8Array
 async function fetchVideoData(playbackId, sendProgress) {
-  sendProgress('Fetching manifest...');
+  const directMp4 = await tryDirectMp4(playbackId, sendProgress);
+  if (directMp4) return directMp4;
+
+  // Fallback: Manually download and concatenate HLS streams
+  sendProgress('Fetching master manifest...');
 
   const masterUrl = `https://stream.mux.com/${playbackId}.m3u8`;
   const masterResp = await fetch(masterUrl);
   if (!masterResp.ok) throw new Error(`Master manifest failed: ${masterResp.status}`);
   const masterText = await masterResp.text();
 
-  const renditionUrl = parseMasterPlaylist(masterText, masterUrl);
-  if (!renditionUrl) throw new Error('No rendition found in manifest');
+  const { videoUrl, audioUrl } = parseMasterPlaylist(masterText, masterUrl);
+  if (!videoUrl) throw new Error('No rendition found in manifest');
 
-  sendProgress('Fetching segment list...');
-  const renditionResp = await fetch(renditionUrl);
-  if (!renditionResp.ok) throw new Error(`Rendition manifest failed: ${renditionResp.status}`);
-  const renditionText = await renditionResp.text();
+  const downloadSegments = async (manifestUrl, label) => {
+    sendProgress(`Fetching ${label} segment list...`);
+    const resp = await fetch(manifestUrl);
+    if (!resp.ok) throw new Error(`${label} manifest failed: ${resp.status}`);
+    const { initUrl, segments } = parseRenditionPlaylist(await resp.text(), manifestUrl);
+    
+    if (segments.length === 0) throw new Error(`No ${label} segments found`);
 
-  const { initUrl, segments } = parseRenditionPlaylist(renditionText, renditionUrl);
-  if (segments.length === 0) throw new Error('No segments found');
+    const parts = [];
+    if (initUrl) {
+      sendProgress(`Downloading ${label} init segment...`);
+      const initResp = await fetch(initUrl);
+      if (!initResp.ok) throw new Error(`${label} Init segment failed`);
+      parts.push(await initResp.arrayBuffer());
+    }
 
-  const parts = [];
-  if (initUrl) {
-    sendProgress('Downloading init segment...');
-    const initResp = await fetch(initUrl);
-    if (!initResp.ok) throw new Error(`Init segment failed: ${initResp.status}`);
-    parts.push(await initResp.arrayBuffer());
+    for (let i = 0; i < segments.length; i++) {
+      sendProgress(`Downloading ${label} segment ${i + 1}/${segments.length}...`);
+      const segResp = await fetch(segments[i]);
+      if (!segResp.ok) throw new Error(`${label} Segment ${i} failed`);
+      parts.push(await segResp.arrayBuffer());
+    }
+
+    sendProgress(`Assembling ${label}...`);
+    const totalSize = parts.reduce((sum, p) => sum + p.byteLength, 0);
+    const combined = new Uint8Array(totalSize);
+    let offset = 0;
+    for (const part of parts) {
+      combined.set(new Uint8Array(part), offset);
+      offset += part.byteLength;
+    }
+    return { combined, isMp4: !!initUrl };
+  };
+
+  const videoData = await downloadSegments(videoUrl, 'video');
+
+  let audioData = null;
+  if (audioUrl) {
+    audioData = await downloadSegments(audioUrl, 'audio');
   }
 
-  for (let i = 0; i < segments.length; i++) {
-    sendProgress(`Downloading segment ${i + 1}/${segments.length}...`);
-    const segResp = await fetch(segments[i]);
-    if (!segResp.ok) throw new Error(`Segment ${i} failed: ${segResp.status}`);
-    parts.push(await segResp.arrayBuffer());
+  if (audioData) {
+    return { 
+      type: 'hls-demuxed', 
+      videoCombined: videoData.combined, 
+      audioCombined: audioData.combined,
+      ext: '.mp4', 
+      mimeType: 'video/mp4' 
+    };
+  } else {
+    // If there is no separate audio stream, it's either video-only, or multiplexed TS.
+    const ext = videoData.isMp4 ? '.mp4' : '.ts';
+    const mimeType = videoData.isMp4 ? 'video/mp4' : 'video/MP2T';
+    return { type: 'hls', combined: videoData.combined, ext, mimeType };
   }
-
-  sendProgress('Assembling video...');
-  const totalSize = parts.reduce((sum, p) => sum + p.byteLength, 0);
-  const combined = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const part of parts) {
-    combined.set(new Uint8Array(part), offset);
-    offset += part.byteLength;
-  }
-  return combined;
 }
 
-// Download assembled video data, returns the actual filename Chrome saved it as
-async function downloadVideoData(combined, sendProgress) {
-  sendProgress('Preparing download...');
-  await ensureOffscreenDocument();
+// Initiate the chrome download and wait for it to finish
+async function executeDownload(videoData, intendedName, sendProgress) {
+  let downloadUrl = videoData.url;
 
-  const blobUrlResponse = await chrome.runtime.sendMessage({
-    action: 'createBlobUrl',
-    data: Array.from(combined)
-  });
+  if (videoData.type === 'hls-demuxed') {
+    sendProgress('Combining audio & video frames (might take a moment)...');
+    await ensureOffscreenDocument();
 
-  if (!blobUrlResponse || !blobUrlResponse.blobUrl) {
-    throw new Error('Failed to create blob URL');
+    const videoId = 'video_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+    const audioId = 'audio_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+    
+    await idbPut(videoId, videoData.videoCombined.buffer);
+    await idbPut(audioId, videoData.audioCombined.buffer);
+
+    const blobUrlResponse = await chrome.runtime.sendMessage({
+      action: 'muxAndCreateBlobUrl',
+      videoId,
+      audioId
+    });
+
+    if (!blobUrlResponse || !blobUrlResponse.blobUrl) {
+      throw new Error('Failed to create blob URL: ' + (blobUrlResponse ? blobUrlResponse.error : 'Unknown'));
+    }
+    downloadUrl = blobUrlResponse.blobUrl;
+
+  } else if (videoData.type === 'hls') {
+    sendProgress('Preparing merged file...');
+    await ensureOffscreenDocument();
+
+    const blobId = 'video_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+    
+    await idbPut(blobId, videoData.combined.buffer);
+
+    const blobUrlResponse = await chrome.runtime.sendMessage({
+      action: 'createBlobUrlFromIdb',
+      id: blobId,
+      mimeType: videoData.mimeType
+    });
+
+    if (!blobUrlResponse || !blobUrlResponse.blobUrl) {
+      throw new Error('Failed to create blob URL: ' + (blobUrlResponse ? blobUrlResponse.error : 'Unknown'));
+    }
+    downloadUrl = blobUrlResponse.blobUrl;
   }
+
+  sendProgress('Starting download...');
 
   return new Promise((resolve, reject) => {
     chrome.downloads.download({
-      url: blobUrlResponse.blobUrl,
-      conflictAction: 'uniquify'
+      url: downloadUrl,
+      filename: `mux-videos/${intendedName}`,
+      conflictAction: 'uniquify',
+      saveAs: false
     }, (downloadId) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
         return;
       }
 
-      // Wait for download to get a filename, then resolve with the info
+      // Wait for complete
       const listener = (delta) => {
-        if (delta.id === downloadId && delta.filename) {
-          chrome.downloads.onChanged.removeListener(listener);
-          chrome.downloads.search({ id: downloadId }, (results) => {
-            if (results && results.length > 0) {
-              resolve({
-                downloadId,
-                actualPath: results[0].filename // full path on disk
-              });
-            } else {
-              resolve({ downloadId, actualPath: null });
-            }
-          });
-        }
-        // Also handle completion
-        if (delta.id === downloadId && delta.state && delta.state.current === 'complete') {
-          chrome.downloads.onChanged.removeListener(listener);
-          chrome.downloads.search({ id: downloadId }, (results) => {
-            if (results && results.length > 0) {
-              resolve({
-                downloadId,
-                actualPath: results[0].filename
-              });
-            } else {
-              resolve({ downloadId, actualPath: null });
-            }
-          });
+        if (delta.id === downloadId && delta.state) {
+          if (delta.state.current === 'complete') {
+            chrome.downloads.onChanged.removeListener(listener);
+            resolve();
+          } else if (delta.state.current === 'interrupted') {
+            chrome.downloads.onChanged.removeListener(listener);
+            reject(new Error('Download interrupted.'));
+          }
         }
       };
+      
       chrome.downloads.onChanged.addListener(listener);
 
-      // Fallback: resolve after a short delay if events don't fire
-      setTimeout(() => {
-        chrome.downloads.onChanged.removeListener(listener);
+      const interval = setInterval(() => {
         chrome.downloads.search({ id: downloadId }, (results) => {
           if (results && results.length > 0) {
-            resolve({
-              downloadId,
-              actualPath: results[0].filename
-            });
-          } else {
-            resolve({ downloadId, actualPath: null });
+            const item = results[0];
+            if (item.state === 'complete') {
+              clearInterval(interval);
+              chrome.downloads.onChanged.removeListener(listener);
+              resolve();
+            } else if (item.state === 'interrupted') {
+              clearInterval(interval);
+              chrome.downloads.onChanged.removeListener(listener);
+              reject(new Error('Download interrupted.'));
+            }
           }
         });
-      }, 3000);
+      }, 500);
     });
   });
 }
 
-// Generate a rename batch script
-function generateRenameBat(mappings) {
-  let bat = '@echo off\r\necho Renaming Keyframe Gallery videos...\r\necho.\r\n';
-
-  for (const { actualFilename, intendedName } of mappings) {
-    // Escape special batch characters
-    const safeActual = actualFilename.replace(/"/g, '""');
-    const safeIntended = intendedName.replace(/"/g, '""');
-    bat += `if exist "${safeActual}" (\r\n`;
-    bat += `  ren "${safeActual}" "${safeIntended}"\r\n`;
-    bat += `  echo Renamed: ${safeIntended}\r\n`;
-    bat += `) else (\r\n`;
-    bat += `  echo SKIP: ${safeActual} not found\r\n`;
-    bat += `)\r\n`;
-  }
-
-  bat += '\r\necho.\r\necho Done! Press any key to close.\r\npause >nul\r\n';
-  return bat;
+function makeIntendedName(video, ext) {
+  const safeTitle = (video.title || 'Untitled')
+    .replace(/[<>:"/\\|?*]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .substring(0, 80);
+  const safeCompany = (video.company || 'Unknown')
+    .replace(/[<>:"/\\|?*]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return `${safeTitle} - ${safeCompany}${ext || '.mp4'}`;
 }
 
 // Track active downloads for progress reporting
 const downloadProgress = {};
-// Track download mappings for rename script
-const downloadMappings = [];
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'downloadVideo') {
-    const { playbackId, intendedName } = request;
+    const { video } = request;
 
     (async () => {
       try {
-        const combined = await fetchVideoData(playbackId, (status) => {
-          downloadProgress[playbackId] = status;
+        const videoData = await fetchVideoData(video.playbackId, (status) => {
+          downloadProgress[video.playbackId] = status;
         });
 
-        const result = await downloadVideoData(combined, (status) => {
-          downloadProgress[playbackId] = status;
+        const intendedName = makeIntendedName(video, videoData.ext);
+
+        await executeDownload(videoData, intendedName, (status) => {
+          downloadProgress[video.playbackId] = status;
         });
 
-        if (result.actualPath) {
-          const actualFilename = result.actualPath.split('\\').pop().split('/').pop();
-          downloadMappings.push({ actualFilename, intendedName });
-        }
-
-        downloadProgress[playbackId] = 'Complete!';
-        sendResponse({ success: true, downloadId: result.downloadId });
+        downloadProgress[video.playbackId] = 'Complete!';
+        sendResponse({ success: true, ext: videoData.ext });
       } catch (err) {
-        downloadProgress[playbackId] = `Error: ${err.message}`;
+        downloadProgress[video.playbackId] = `Error: ${err.message}`;
         sendResponse({ success: false, error: err.message });
       }
     })();
@@ -254,24 +343,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     (async () => {
       let completed = 0;
       let failed = 0;
-      downloadMappings.length = 0; // clear previous
 
       for (const video of videos) {
-        const intendedName = makeIntendedName(video);
-
         try {
-          const combined = await fetchVideoData(video.playbackId, (status) => {
+          const videoData = await fetchVideoData(video.playbackId, (status) => {
             downloadProgress[video.playbackId] = status;
           });
 
-          const result = await downloadVideoData(combined, (status) => {
+          const intendedName = makeIntendedName(video, videoData.ext);
+
+          await executeDownload(videoData, intendedName, (status) => {
             downloadProgress[video.playbackId] = status;
           });
-
-          if (result.actualPath) {
-            const actualFilename = result.actualPath.split('\\').pop().split('/').pop();
-            downloadMappings.push({ actualFilename, intendedName });
-          }
 
           downloadProgress[video.playbackId] = 'Complete!';
           completed++;
@@ -281,79 +364,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
       }
 
-      // Generate and download rename script
-      if (downloadMappings.length > 0) {
-        const batContent = generateRenameBat(downloadMappings);
-        const encoder = new TextEncoder();
-        const batData = encoder.encode(batContent);
-
-        await ensureOffscreenDocument();
-        const blobResp = await chrome.runtime.sendMessage({
-          action: 'createBlobUrl',
-          data: Array.from(batData),
-          mimeType: 'application/bat'
-        });
-
-        if (blobResp && blobResp.blobUrl) {
-          chrome.downloads.download({
-            url: blobResp.blobUrl,
-            filename: 'keyframe-videos/rename_videos.bat',
-            conflictAction: 'overwrite'
-          });
-        }
-      }
-
       sendResponse({ success: true, completed, failed, total: videos.length });
     })();
 
     return true;
   }
-
-  // Generate rename script on demand
-  if (request.action === 'generateRenameScript') {
-    if (downloadMappings.length === 0) {
-      sendResponse({ success: false, error: 'No downloads tracked yet' });
-      return false;
-    }
-
-    (async () => {
-      const batContent = generateRenameBat(downloadMappings);
-      const encoder = new TextEncoder();
-      const batData = encoder.encode(batContent);
-
-      await ensureOffscreenDocument();
-      const blobResp = await chrome.runtime.sendMessage({
-        action: 'createBlobUrl',
-        data: Array.from(batData),
-        mimeType: 'application/bat'
-      });
-
-      if (blobResp && blobResp.blobUrl) {
-        chrome.downloads.download({
-          url: blobResp.blobUrl,
-          filename: 'keyframe-videos/rename_videos.bat',
-          conflictAction: 'overwrite'
-        }, (downloadId) => {
-          sendResponse({ success: true });
-        });
-      } else {
-        sendResponse({ success: false, error: 'Could not create rename script' });
-      }
-    })();
-
-    return true;
-  }
 });
-
-function makeIntendedName(video) {
-  const safeTitle = (video.title || 'Untitled')
-    .replace(/[<>:"/\\|?*]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .substring(0, 80);
-  const safeCompany = (video.company || 'Unknown')
-    .replace(/[<>:"/\\|?*]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return `${safeTitle} - ${safeCompany}.mp4`;
-}
