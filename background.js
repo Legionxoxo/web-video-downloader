@@ -1,142 +1,108 @@
-// Background service worker: downloads Mux videos by parsing HLS manifests
+// background.js - Service worker handling HLS fetching and coordination with FFmpeg
 
-// Save large buffers to IndexedDB to avoid the 64MiB message size limit
-function idbPut(id, buffer) {
+// Local map to force filenames for Blob URLs (overcoming Chromium cross-context stripping)
+const blobNameMap = new Map();
+
+chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+  if (blobNameMap.has(item.url)) {
+    suggest({ filename: blobNameMap.get(item.url), conflictAction: 'uniquify' });
+  } else {
+    suggest();
+  }
+});
+
+// Helper to interact with IndexedDB from background script
+async function idbPut(id, buffer) {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open('MuxDownloaderDB', 1);
-    request.onupgradeneeded = e => e.target.result.createObjectStore('blobs');
-    request.onsuccess = e => {
+    const requestDb = indexedDB.open('MuxDownloaderDB', 1);
+    requestDb.onupgradeneeded = e => e.target.result.createObjectStore('blobs');
+    requestDb.onsuccess = e => {
       const db = e.target.result;
       const tx = db.transaction('blobs', 'readwrite');
-      const putReq = tx.objectStore('blobs').put(buffer, id);
-      putReq.onsuccess = () => resolve();
-      putReq.onerror = () => reject(tx.error);
+      tx.objectStore('blobs').put(buffer, id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(new Error('IDB put failed'));
     };
-    request.onerror = e => reject(request.error);
+    requestDb.onerror = () => reject(new Error('IDB open failed'));
   });
 }
 
-// Ensure the offscreen document exists (for blob URL creation)
-let creatingOffscreen = null;
-async function ensureOffscreenDocument() {
-  const existingContexts = await chrome.runtime.getContexts({
+// Function to ensure offscreen document exists
+let downloadCountSinceRestart = 0;
+const RESTART_THRESHOLD = 50;
+
+async function ensureOffscreenDocument(forceRestart = false) {
+  const contexts = await chrome.runtime.getContexts({
     contextTypes: ['OFFSCREEN_DOCUMENT']
   });
-  if (existingContexts.length > 0) return;
-
-  if (creatingOffscreen) {
-    await creatingOffscreen;
-  } else {
-    creatingOffscreen = chrome.offscreen.createDocument({
-      url: 'offscreen.html',
-      reasons: ['BLOBS'],
-      justification: 'Create blob URLs for video downloads'
-    });
-    await creatingOffscreen;
-    creatingOffscreen = null;
+  
+  if (forceRestart && contexts.length > 0) {
+    await chrome.offscreen.closeDocument();
+  } else if (contexts.length > 0) {
+    return;
   }
+  
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['DOM_PARSER', 'BLOBS', 'LOCAL_STORAGE'],
+    justification: 'FFmpeg wasm requires DOM APIs and IndexedDB for video processing.'
+  });
+  downloadCountSinceRestart = 0;
 }
 
-// Parse a master m3u8 playlist and return the highest quality rendition URL
-function parseMasterPlaylist(m3u8Text, baseUrl) {
-  const lines = m3u8Text.split('\n');
-  let bestBandwidth = 0;
-  let videoUrl = null;
-  let audioGroupId = null;
+function parseRenditionPlaylist(text, baseUrl) {
+  const lines = text.split('\n');
+  const segments = [];
+  let initUrl = null;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
-    if (line.startsWith('#EXT-X-STREAM-INF:')) {
-      const bwMatch = line.match(/BANDWIDTH=(\d+)/);
-      const bandwidth = bwMatch ? parseInt(bwMatch[1]) : 0;
-      
-      const audioMatch = line.match(/AUDIO="([^"]+)"/);
-      const currentAudioGroup = audioMatch ? audioMatch[1] : null;
-
-      for (let j = i + 1; j < lines.length; j++) {
-        const urlLine = lines[j].trim();
-        if (urlLine && !urlLine.startsWith('#')) {
-          if (bandwidth > bestBandwidth) {
-            bestBandwidth = bandwidth;
-            videoUrl = urlLine.startsWith('http') ? urlLine : new URL(urlLine, baseUrl).href;
-            audioGroupId = currentAudioGroup;
-          }
-          break;
-        }
-      }
-    }
-  }
-
-  let audioUrl = null;
-  if (audioGroupId) {
-    // Find the audio track matching this group
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (line.startsWith('#EXT-X-MEDIA:TYPE=AUDIO') && line.includes(`GROUP-ID="${audioGroupId}"`)) {
-        const uriMatch = line.match(/URI="([^"]+)"/);
-        if (uriMatch) {
-           const uri = uriMatch[1];
-           audioUrl = uri.startsWith('http') ? uri : new URL(uri, baseUrl).href;
-           break;
-        }
-      }
-    }
-  }
-
-  return { videoUrl, audioUrl };
-}
-
-// Parse a rendition m3u8 and return init segment URL + media segment URLs
-function parseRenditionPlaylist(m3u8Text, baseUrl) {
-  const lines = m3u8Text.split('\n');
-  let initUrl = null;
-  const segments = [];
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    const mapMatch = trimmed.match(/#EXT-X-MAP:URI="([^"]+)"/);
-    if (mapMatch) {
-      const uri = mapMatch[1];
-      initUrl = uri.startsWith('http') ? uri : new URL(uri, baseUrl).href;
-    }
-    if (trimmed && !trimmed.startsWith('#')) {
-      const url = trimmed.startsWith('http') ? trimmed : new URL(trimmed, baseUrl).href;
-      segments.push(url);
+    if (line.startsWith('#EXT-X-MAP:URI=')) {
+      const match = line.match(/URI="([^"]+)"/);
+      if (match) initUrl = new URL(match[1], baseUrl).href;
+    } else if (line && !line.startsWith('#')) {
+      segments.push(new URL(line, baseUrl).href);
     }
   }
   return { initUrl, segments };
 }
 
-// Test if native MP4 download is available for this video
-async function tryDirectMp4(playbackId, sendProgress) {
-  sendProgress('Checking native MP4 availability...');
-  const url = `https://stream.mux.com/${playbackId}/high.mp4`;
-  try {
-    const res = await fetch(url, { method: 'HEAD' });
-    if (res.ok) {
-      return { type: 'direct', url, ext: '.mp4', mimeType: 'video/mp4' };
-    }
-  } catch (e) {
-    // Ignore, fallback to HLS
-  }
-  return null;
-}
-
-// Fetch and assemble a video, return as Uint8Array
+// Fetches all segments of a Mux video and combines them
 async function fetchVideoData(playbackId, sendProgress) {
-  const directMp4 = await tryDirectMp4(playbackId, sendProgress);
-  if (directMp4) return directMp4;
-
-  // Fallback: Manually download and concatenate HLS streams
-  sendProgress('Fetching master manifest...');
-
   const masterUrl = `https://stream.mux.com/${playbackId}.m3u8`;
+  
+  sendProgress('Fetching master manifest...');
   const masterResp = await fetch(masterUrl);
-  if (!masterResp.ok) throw new Error(`Master manifest failed: ${masterResp.status}`);
+  if (!masterResp.ok) throw new Error('Master manifest failed');
   const masterText = await masterResp.text();
 
-  const { videoUrl, audioUrl } = parseMasterPlaylist(masterText, masterUrl);
-  if (!videoUrl) throw new Error('No rendition found in manifest');
+  // Pick highest quality rendition and separate audio if present
+  let videoUrl = masterUrl;
+  let audioUrl = null;
+
+  const lines = masterText.split('\n');
+  let bestBandwidth = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('#EXT-X-STREAM-INF:')) {
+      const bwMatch = lines[i].match(/BANDWIDTH=(\d+)/);
+      const codecMatch = lines[i].match(/CODECS="([^"]+)"/);
+      const bandwidth = bwMatch ? parseInt(bwMatch[1]) : 0;
+      
+      // If we see CODECS property, it's a variant playlist
+      const nextLine = lines[i+1]?.trim();
+      if (nextLine && !nextLine.startsWith('#')) {
+          if (bandwidth > bestBandwidth) {
+            bestBandwidth = bandwidth;
+            videoUrl = new URL(nextLine, masterUrl).href;
+          }
+      }
+    }
+    if (lines[i].startsWith('#EXT-X-MEDIA:TYPE=AUDIO')) {
+      const uriMatch = lines[i].match(/URI="([^"]+)"/);
+      if (uriMatch) audioUrl = new URL(uriMatch[1], masterUrl).href;
+    }
+  }
 
   const downloadSegments = async (manifestUrl, label) => {
     sendProgress(`Fetching ${label} segment list...`);
@@ -188,103 +154,133 @@ async function fetchVideoData(playbackId, sendProgress) {
       mimeType: 'video/mp4' 
     };
   } else {
-    // If there is no separate audio stream, it's either video-only, or multiplexed TS.
     const ext = videoData.isMp4 ? '.mp4' : '.ts';
     const mimeType = videoData.isMp4 ? 'video/mp4' : 'video/MP2T';
-    return { type: 'hls', combined: videoData.combined, ext, mimeType };
+    const type = videoData.isMp4 ? 'hls' : 'hls-ts-to-mp4';
+    return { type, combined: videoData.combined, ext: '.mp4', mimeType: 'video/mp4' };
   }
 }
 
-// Initiate the chrome download and wait for it to finish
 async function executeDownload(videoData, intendedName, sendProgress) {
   let downloadUrl = videoData.url;
+  let isBlob = false;
 
-  if (videoData.type === 'hls-demuxed') {
-    sendProgress('Combining audio & video frames (might take a moment)...');
-    await ensureOffscreenDocument();
-
-    const videoId = 'video_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
-    const audioId = 'audio_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+  if (videoData.type === 'hls-demuxed' || videoData.type === 'hls' || videoData.type === 'hls-ts-to-mp4') {
+    downloadCountSinceRestart++;
+    const shouldRestart = downloadCountSinceRestart >= RESTART_THRESHOLD;
+    await ensureOffscreenDocument(shouldRestart);
     
-    await idbPut(videoId, videoData.videoCombined.buffer);
-    await idbPut(audioId, videoData.audioCombined.buffer);
+    if (videoData.type === 'hls-demuxed') {
+      sendProgress('Combining audio & video frames...');
+      const videoId = 'video_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+      const audioId = 'audio_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+      
+      await idbPut(videoId, videoData.videoCombined.buffer);
+      await idbPut(audioId, videoData.audioCombined.buffer);
 
-    const blobUrlResponse = await chrome.runtime.sendMessage({
-      action: 'muxAndCreateBlobUrl',
-      videoId,
-      audioId
-    });
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: 'muxAndCreateBlobUrl',
+          videoId,
+          audioId
+        });
 
-    if (!blobUrlResponse || !blobUrlResponse.blobUrl) {
-      throw new Error('Failed to create blob URL: ' + (blobUrlResponse ? blobUrlResponse.error : 'Unknown'));
+        if (!resp || !resp.blobUrl) {
+          throw new Error('Failed to create file: ' + (resp ? (resp.error || 'No blob URL') : 'Unknown'));
+        }
+        downloadUrl = resp.blobUrl;
+        isBlob = true;
+      } catch (err) {
+        await ensureOffscreenDocument(true);
+        throw err;
+      }
+
+    } else if (videoData.type === 'hls-ts-to-mp4') {
+      sendProgress('Converting TS to MP4 container...');
+      const videoId = 'video_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+      await idbPut(videoId, videoData.combined.buffer);
+
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: 'convertTsToMp4',
+          videoId
+        });
+
+        if (!resp || !resp.blobUrl) {
+          throw new Error('Failed to create file: ' + (resp ? (resp.error || 'No blob URL') : 'Unknown'));
+        }
+        downloadUrl = resp.blobUrl;
+        isBlob = true;
+      } catch (err) {
+        await ensureOffscreenDocument(true);
+        throw err;
+      }
+
+    } else if (videoData.type === 'hls') {
+      sendProgress('Preparing merged file...');
+      const blobId = 'video_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+      await idbPut(blobId, videoData.combined.buffer);
+
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: 'createBlobUrlFromIdb',
+          id: blobId,
+          mimeType: videoData.mimeType
+        });
+
+        if (!resp || !resp.blobUrl) {
+          throw new Error('Failed to create file: ' + (resp ? (resp.error || 'No blob URL') : 'Unknown'));
+        }
+        downloadUrl = resp.blobUrl;
+        isBlob = true;
+      } catch (err) {
+        await ensureOffscreenDocument(true);
+        throw err;
+      }
     }
-    downloadUrl = blobUrlResponse.blobUrl;
-
-  } else if (videoData.type === 'hls') {
-    sendProgress('Preparing merged file...');
-    await ensureOffscreenDocument();
-
-    const blobId = 'video_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
-    
-    await idbPut(blobId, videoData.combined.buffer);
-
-    const blobUrlResponse = await chrome.runtime.sendMessage({
-      action: 'createBlobUrlFromIdb',
-      id: blobId,
-      mimeType: videoData.mimeType
-    });
-
-    if (!blobUrlResponse || !blobUrlResponse.blobUrl) {
-      throw new Error('Failed to create blob URL: ' + (blobUrlResponse ? blobUrlResponse.error : 'Unknown'));
-    }
-    downloadUrl = blobUrlResponse.blobUrl;
   }
 
-  sendProgress('Starting download...');
+  const finalFilename = `mux-videos/${intendedName}`;
+  
+  if (isBlob) {
+    blobNameMap.set(downloadUrl, finalFilename);
+  }
+
+  sendProgress('Downloading via Chrome...');
 
   return new Promise((resolve, reject) => {
     chrome.downloads.download({
       url: downloadUrl,
-      filename: `mux-videos/${intendedName}`,
+      filename: finalFilename,
       conflictAction: 'uniquify',
       saveAs: false
     }, (downloadId) => {
       if (chrome.runtime.lastError) {
+        if (isBlob) blobNameMap.delete(downloadUrl);
         reject(new Error(chrome.runtime.lastError.message));
         return;
       }
 
-      // Wait for complete
-      const listener = (delta) => {
+      const listener = async (delta) => {
         if (delta.id === downloadId && delta.state) {
-          if (delta.state.current === 'complete') {
+          if (delta.state.current === 'complete' || delta.state.current === 'interrupted') {
             chrome.downloads.onChanged.removeListener(listener);
-            resolve();
-          } else if (delta.state.current === 'interrupted') {
-            chrome.downloads.onChanged.removeListener(listener);
-            reject(new Error('Download interrupted.'));
+            
+            if (isBlob) {
+              blobNameMap.delete(downloadUrl);
+              chrome.runtime.sendMessage({ action: 'revokeBlobUrl', url: downloadUrl }).catch(()=>{});
+            }
+
+            if (delta.state.current === 'complete') {
+              resolve();
+            } else {
+              reject(new Error('Download interrupted.'));
+            }
           }
         }
       };
       
       chrome.downloads.onChanged.addListener(listener);
-
-      const interval = setInterval(() => {
-        chrome.downloads.search({ id: downloadId }, (results) => {
-          if (results && results.length > 0) {
-            const item = results[0];
-            if (item.state === 'complete') {
-              clearInterval(interval);
-              chrome.downloads.onChanged.removeListener(listener);
-              resolve();
-            } else if (item.state === 'interrupted') {
-              clearInterval(interval);
-              chrome.downloads.onChanged.removeListener(listener);
-              reject(new Error('Download interrupted.'));
-            }
-          }
-        });
-      }, 500);
     });
   });
 }
@@ -302,7 +298,6 @@ function makeIntendedName(video, ext) {
   return `${safeTitle} - ${safeCompany}${ext || '.mp4'}`;
 }
 
-// Track active downloads for progress reporting
 const downloadProgress = {};
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -335,38 +330,5 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'getProgress') {
     sendResponse({ progress: downloadProgress });
     return false;
-  }
-
-  if (request.action === 'downloadAll') {
-    const { videos } = request;
-
-    (async () => {
-      let completed = 0;
-      let failed = 0;
-
-      for (const video of videos) {
-        try {
-          const videoData = await fetchVideoData(video.playbackId, (status) => {
-            downloadProgress[video.playbackId] = status;
-          });
-
-          const intendedName = makeIntendedName(video, videoData.ext);
-
-          await executeDownload(videoData, intendedName, (status) => {
-            downloadProgress[video.playbackId] = status;
-          });
-
-          downloadProgress[video.playbackId] = 'Complete!';
-          completed++;
-        } catch (err) {
-          downloadProgress[video.playbackId] = `Error: ${err.message}`;
-          failed++;
-        }
-      }
-
-      sendResponse({ success: true, completed, failed, total: videos.length });
-    })();
-
-    return true;
   }
 });

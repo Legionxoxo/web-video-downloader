@@ -51,14 +51,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'createBlobUrlFromIdb') {
     getFromIdb(request.id).then(buffer => {
       if (!buffer) {
-        sendResponse({ blobUrl: null, error: 'Buffer not found' });
+        sendResponse({ error: 'Buffer not found' });
         return;
       }
       const blob = new Blob([buffer], { type: request.mimeType || 'video/mp4' });
       sendResponse({ blobUrl: URL.createObjectURL(blob) });
       deleteFromIdb(request.id);
     }).catch(err => {
-      sendResponse({ blobUrl: null, error: err.message });
+      sendResponse({ error: err.message });
     });
     return true;
   }
@@ -86,20 +86,64 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const blob = new Blob([mp4Data.buffer], { type: 'video/mp4' });
         const url = URL.createObjectURL(blob);
         
-        // Cleanup memory
-        await ffmpeg.deleteFile('video.ts');
-        await ffmpeg.deleteFile('audio.ts');
-        await ffmpeg.deleteFile('output.mp4');
-        
+        // Cleanup memory in FFmpeg
+        ffmpeg.deleteFile('video.ts').catch(()=>{});
+        ffmpeg.deleteFile('audio.ts').catch(()=>{});
+        ffmpeg.deleteFile('output.mp4').catch(()=>{});
         deleteFromIdb(request.videoId);
         deleteFromIdb(request.audioId);
         
         sendResponse({ blobUrl: url });
       } catch (err) {
         console.error('Mux error:', err);
-        sendResponse({ blobUrl: null, error: err.message });
+        sendResponse({ error: err.message || String(err) });
       }
     })();
     return true;
+  }
+
+  if (request.action === 'convertTsToMp4') {
+    (async () => {
+      try {
+        await initFfmpeg();
+        
+        const videoBuffer = await getFromIdb(request.videoId);
+        
+        if (!videoBuffer) {
+          throw new Error('Missing video buffer in IDB');
+        }
+        
+        await ffmpeg.writeFile('video.ts', new Uint8Array(videoBuffer));
+        
+        // Convert to standard MP4 container instantly
+        await ffmpeg.exec(['-i', 'video.ts', '-c', 'copy', 'output.mp4']);
+        
+        const mp4Data = await ffmpeg.readFile('output.mp4');
+        
+        const blob = new Blob([mp4Data.buffer], { type: 'video/mp4' });
+        const url = URL.createObjectURL(blob);
+        
+        // Cleanup memory in FFmpeg
+        ffmpeg.deleteFile('video.ts').catch(()=>{});
+        ffmpeg.deleteFile('output.mp4').catch(()=>{});
+        deleteFromIdb(request.videoId);
+        
+        sendResponse({ blobUrl: url });
+      } catch (err) {
+        console.error('Convert error:', err);
+        sendResponse({ error: err.message || String(err) });
+      }
+    })();
+    return true;
+  }
+
+  if (request.action === 'revokeBlobUrl') {
+    try {
+      URL.revokeObjectURL(request.url);
+      sendResponse({ success: true });
+    } catch (err) {
+      sendResponse({ success: false, error: err.message || String(err) });
+    }
+    return false;
   }
 });

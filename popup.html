@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <style>
@@ -136,9 +137,32 @@
       border-color: #FAC800;
     }
 
-    .btn-download svg {
+    .btn-download svg,
+    .btn-retry svg {
       width: 16px;
       height: 16px;
+    }
+
+    .btn-retry {
+      flex-shrink: 0;
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      border: 1px solid #333;
+      background: transparent;
+      color: #f87171;
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s;
+      margin-left: 4px;
+    }
+
+    .btn-retry:hover {
+      background: #f87171;
+      color: #111;
+      border-color: #f87171;
     }
 
     .loading {
@@ -159,7 +183,9 @@
     }
 
     @keyframes spin {
-      to { transform: rotate(360deg); }
+      to {
+        transform: rotate(360deg);
+      }
     }
 
     .empty {
@@ -182,14 +208,18 @@
     }
   </style>
 </head>
+
 <body>
   <div class="header">
     <h1>⬇ <span>Mux Video</span> Downloader</h1>
     <div class="stats" id="stats">Scanning page...</div>
     <div style="display: flex; gap: 8px; margin-top: 8px;">
       <button class="btn-download-all" id="downloadAll" disabled>Download All</button>
-      <button class="btn-download-all" id="autoScroll" style="background:#444; color:#eee;">Scroll & Find More</button>
+      <button class="btn-download-all" id="autoScroll" style="background:#444; color:#eee;">Auto-Scroll & Find
+        More</button>
     </div>
+    <button class="btn-download-all" id="retryAll"
+      style="background:#f87171; color:#111; margin-top: 8px; display: none;">Retry All Failed</button>
   </div>
 
   <div id="content">
@@ -203,4 +233,5 @@
 
   <script src="popup.js"></script>
 </body>
+
 </html>
