@@ -306,6 +306,57 @@ function makeIntendedName(video, ext) {
 const downloadProgress = {};
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // ===== IMAGE DOWNLOAD (before.click) =====
+  // Note: We delegate image fetching to the content script because fetch() from
+  // the service worker context is blocked by CORS. The content script runs in the
+  // same origin as the page, so it can access these resources.
+  if (request.action === 'downloadImage') {
+    const { imageUrl, filename } = request;
+
+    // Ask the content script to fetch the image as a data URL (same-origin, no CORS)
+    chrome.tabs.sendMessage(request.tabId, {
+      action: 'fetchImageAsDataUrl',
+      imageUrl,
+      filename
+    }, (response) => {
+      if (response && response.success && response.dataUrl) {
+        // Now use the data URL for download
+        const blobUrl = response.dataUrl;
+
+        chrome.downloads.download({
+          url: blobUrl,
+          filename: `before-click-images/${filename}`,
+          conflictAction: 'uniquify',
+          saveAs: false
+        }, (downloadId) => {
+          if (chrome.runtime.lastError) {
+            sendResponse({ success: false, error: chrome.runtime.lastError.message });
+            return;
+          }
+
+          // Wait for download to complete
+          const interval = setInterval(() => {
+            chrome.downloads.search({ id: downloadId }, (results) => {
+              if (results && results.length > 0) {
+                if (results[0].state === 'complete') {
+                  clearInterval(interval);
+                  sendResponse({ success: true });
+                } else if (results[0].state === 'interrupted') {
+                  clearInterval(interval);
+                  sendResponse({ success: false, error: 'Download interrupted' });
+                }
+              }
+            });
+          }, 500);
+        });
+      } else {
+        sendResponse({ success: false, error: response?.error || 'Failed to fetch image' });
+      }
+    });
+    return true;
+  }
+
+  // ===== VIDEO DOWNLOAD (keyframe, framerate) =====
   if (request.action === 'downloadVideo') {
     const { video } = request;
 

@@ -1,10 +1,13 @@
 // Popup script: communicates with content script and triggers downloads
 // Supports keyframe.gallery, framerate.tv with Google Sheets history sync
+// Also supports before.click for image downloads
 
 let allVideos = [];
+let allApps = []; // for before.click image mode
 let activeTabId = null;
 let failedIndices = new Set();
-let downloadHistory = new Set(); // "Title - Company" keys
+let failedImageApps = new Set(); // for before.click
+let downloadHistory = new Set(); // "Title - Company" keys for videos, "name-category" for before.click
 let currentSite = null;
 
 const SHEET_URL = 'https://script.google.com/macros/s/AKfycbw_e6kNjE9xvqS_yBP4xd8EnP2ipf8opNt2rbwP1oZiaWN4lkogVe0AhhGZf6_3A4Hl5w/exec';
@@ -31,21 +34,12 @@ async function syncFromSheet(site) {
     const resp = await fetch(`${SHEET_URL}?site=${encodeURIComponent(site)}`);
     if (!resp.ok) throw new Error('Sheet fetch failed');
     const data = await resp.json();
-    // Use "title - creator" as key to match history_seed.json format
+    // Sheet stores "title - creator" as the unique key
     downloadHistory = new Set(data.map(r => `${r.title} - ${r.creator}`));
     console.log(`Synced ${downloadHistory.size} entries from Sheet for site: ${site}`);
   } catch (err) {
     console.error('Failed to sync from Sheet:', err);
-    // Fall back to loading from history_seed.json for initial seed
-    try {
-      const resp = await fetch(chrome.runtime.getURL('history_seed.json'));
-      if (resp.ok) {
-        const seed = await resp.json();
-        downloadHistory = new Set(seed);
-      }
-    } catch (e) {
-      downloadHistory = new Set();
-    }
+    downloadHistory = new Set();
   }
 }
 
@@ -59,7 +53,7 @@ async function appendToSheet(site, title, company) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         site,
-        content_type: 'video',
+        content_type: site === 'before' ? 'image' : 'video',
         unique_id: '',
         title,
         creator: company,
@@ -78,6 +72,22 @@ async function markAsDownloaded(title, company) {
   downloadHistory.add(key);
 }
 
+function makeImageFilename(appName, category, index, ext) {
+  const safeAppName = (appName || 'unknown')
+    .replace(/[<>:"/\\|?*]/g, '')
+    .replace(/\s+/g, '-')
+    .trim()
+    .toLowerCase()
+    .substring(0, 50);
+  const safeCategory = (category || 'unknown')
+    .replace(/[<>:"/\\|?*]/g, '')
+    .replace(/\s+/g, '-')
+    .trim()
+    .toLowerCase()
+    .substring(0, 50);
+  return `${safeAppName}-${safeCategory}-${index}${ext}`;
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   const content = document.getElementById('content');
   const stats = document.getElementById('stats');
@@ -94,19 +104,104 @@ document.addEventListener('DOMContentLoaded', async () => {
     await syncFromSheet(currentSite);
   }
 
+  // Update site indicator in header
+  const siteIndicator = document.getElementById('siteIndicator');
+  if (siteIndicator) {
+    if (currentSite === 'before') {
+      siteIndicator.textContent = 'IMAGES';
+      siteIndicator.style.background = '#4ade80';
+      siteIndicator.style.color = '#111';
+    } else if (currentSite === 'keyframe') {
+      siteIndicator.textContent = 'KEYFRAME';
+      siteIndicator.style.background = '#333';
+    } else if (currentSite === 'framerate') {
+      siteIndicator.textContent = 'FRAMERATE';
+      siteIndicator.style.background = '#333';
+    }
+  }
+
   async function fetchAndRender() {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
       if (!tab || tab.url.startsWith('chrome://') || tab.url.startsWith('edge://')) {
-        content.innerHTML = '<div class="empty">Navigate to a website with Mux videos to use this extension.</div>';
+        content.innerHTML = '<div class="empty">Navigate to a website with Mux videos or before.click images to use this extension.</div>';
         stats.textContent = 'Invalid Page';
         return;
       }
       activeTabId = tab.id;
 
       const response = await chrome.tabs.sendMessage(tab.id, { action: 'getVideos' });
+
+      // Handle before.click image mode
+      if (response.site === 'before') {
+        allApps = response.apps || [];
+        allVideos = [];
+
+        if (allApps.length === 0) {
+          content.innerHTML = '<div class="empty">No apps found on this page.<br>Try scrolling down to load more apps first.</div>';
+          stats.textContent = '0 apps found';
+          downloadAllBtn.disabled = true;
+          downloadAllBtn.textContent = 'Download All';
+          return;
+        }
+
+        const totalImages = allApps.reduce((sum, app) => sum + app.images.length, 0);
+        stats.textContent = `${allApps.length} apps (${totalImages} images) found`;
+        downloadAllBtn.disabled = false;
+        downloadAllBtn.textContent = `Download All (${allApps.length} apps)`;
+
+        content.innerHTML = '<div class="video-list" id="videoList"></div>';
+        const videoList = document.getElementById('videoList');
+
+        allApps.forEach((app, index) => {
+          const item = document.createElement('div');
+          item.className = 'video-item';
+          item.id = `video-${index}`;
+
+          const historyKey = `${app.name} - ${app.category}`;
+          const isDownloaded = downloadHistory.has(historyKey);
+          const thumb = app.images[0] || '';
+
+          item.innerHTML = `
+            <img class="video-thumb" src="${thumb}" alt="" loading="lazy">
+            <div class="video-info">
+              <div class="video-title" title="${app.name}">${app.name}</div>
+              <div class="video-company">${app.category} · ${app.images.length} images</div>
+              <div class="video-status" id="status-${index}" style="font-size:10px;color:${isDownloaded ? '#4ade80' : '#FAC800'};margin-top:2px;">
+                ${isDownloaded ? '✓ Already Downloaded' : ''}
+              </div>
+            </div>
+            <button class="btn-download" data-index="${index}" title="Download all images"
+                    style="${isDownloaded ? 'color: #4ade80; opacity: 0.7' : ''}">
+              ${isDownloaded ? '✓' : downloadIcon}
+            </button>
+            <button class="btn-retry" data-index="${index}" id="retry-btn-${index}" title="Retry download">
+              ${retryIcon}
+            </button>
+          `;
+          videoList.appendChild(item);
+        });
+
+        videoList.addEventListener('click', (e) => {
+          const downloadBtn = e.target.closest('.btn-download');
+          const retryBtn = e.target.closest('.btn-retry');
+
+          if (downloadBtn && !downloadBtn.disabled) {
+            const index = parseInt(downloadBtn.dataset.index);
+            downloadSingleAppImages(allApps[index], index, downloadBtn);
+          } else if (retryBtn && !retryBtn.disabled) {
+            const index = parseInt(retryBtn.dataset.index);
+            const iconBtn = document.querySelector(`#video-${index} .btn-download`);
+            downloadSingleAppImages(allApps[index], index, iconBtn);
+          }
+        });
+        return;
+      }
+
+      // Handle video mode (keyframe, framerate)
       allVideos = response.videos || [];
+      allApps = [];
 
       if (allVideos.length === 0) {
         content.innerHTML = '<div class="empty">No videos found on this page.<br>Try scrolling down to load more videos first.</div>';
@@ -242,14 +337,25 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   downloadAllBtn.addEventListener('click', () => {
-    downloadAllSequential(Array.from({length: allVideos.length}, (_, i) => i));
+    if (currentSite === 'before') {
+      downloadAllAppsSequential(Array.from({length: allApps.length}, (_, i) => i));
+    } else {
+      downloadAllSequential(Array.from({length: allVideos.length}, (_, i) => i));
+    }
   });
 
   retryAllBtn.addEventListener('click', () => {
-    const toRetry = Array.from(failedIndices);
-    failedIndices.clear();
-    retryAllBtn.style.display = 'none';
-    downloadAllSequential(toRetry);
+    if (currentSite === 'before') {
+      const toRetry = Array.from(failedImageApps);
+      failedImageApps.clear();
+      retryAllBtn.style.display = 'none';
+      downloadAllAppsSequential(toRetry);
+    } else {
+      const toRetry = Array.from(failedIndices);
+      failedIndices.clear();
+      retryAllBtn.style.display = 'none';
+      downloadAllSequential(toRetry);
+    }
   });
 });
 
@@ -393,6 +499,237 @@ async function downloadAllSequential(indices) {
   statusBar.innerHTML = `Batch Complete: ✓ ${completedCount} done | ⏩ ${skippedCount} skipped | ✗ ${errorCount} failed.`;
 
   if (failedIndices.size > 0) {
+    retryAllBtn.style.display = 'block';
+  } else {
+    retryAllBtn.style.display = 'none';
+  }
+}
+
+// ===== BEFORE.CLICK IMAGE DOWNLOAD FUNCTIONS =====
+
+// Navigate to an app gallery page and extract all images
+async function getAppGalleryImages(appSlug) {
+  // Use the actual before.click origin, not the extension's origin
+  const galleryUrl = `https://before.click/explore?app=${appSlug}`;
+
+  return new Promise((resolve) => {
+    chrome.tabs.update(activeTabId, { url: galleryUrl }, async (tab) => {
+      if (chrome.runtime.lastError) {
+        console.error('Tab update failed:', chrome.runtime.lastError);
+        resolve(null);
+        return;
+      }
+
+      // Wait for tab to finish loading
+      await new Promise(r => setTimeout(r, 2500));
+
+      // Retry sending message a few times in case content script hasn't injected yet
+      let retries = 5;
+      let result = null;
+      while (retries > 0) {
+        try {
+          result = await chrome.tabs.sendMessage(activeTabId, { action: 'getVideos' });
+          if (result) break;
+        } catch (e) {
+          // Content script not ready yet
+        }
+        retries--;
+        if (retries > 0) await new Promise(r => setTimeout(r, 1000));
+      }
+
+      if (result && result.site === 'before' && result.apps && result.apps.length > 0) {
+        resolve(result.apps[0]);
+      } else {
+        resolve(null);
+      }
+    });
+  });
+}
+
+async function downloadSingleAppImages(app, index, btn) {
+  const historyKey = `${app.name} - ${app.category}`;
+
+  if (downloadHistory.has(historyKey)) {
+    if (btn) {
+      btn.innerHTML = '✓';
+      btn.style.color = '#4ade80';
+      btn.style.opacity = '0.7';
+    }
+    const statusEl = document.getElementById(`status-${index}`);
+    if (statusEl) {
+      statusEl.textContent = '✓ Already Downloaded';
+      statusEl.style.color = '#4ade80';
+    }
+    return false;
+  }
+
+  const retryBtn = document.getElementById(`retry-btn-${index}`);
+  if (btn) {
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    btn.innerHTML = downloadIcon;
+  }
+  if (retryBtn) retryBtn.style.display = 'none';
+
+  const statusEl = document.getElementById(`status-${index}`);
+
+  // Check if we're on the gallery page (has all 8 images) or explore page (has only 3 previews)
+  let imagesToDownload = app.images;
+  if (!app.galleryUrl || app.images.length < 8) {
+    // Navigate to gallery page to get all images
+    if (statusEl) statusEl.textContent = 'Opening gallery...';
+    const galleryApp = await getAppGalleryImages(app.slug);
+    if (galleryApp) {
+      imagesToDownload = galleryApp.images;
+    }
+  }
+
+  const totalImages = imagesToDownload.length;
+  let completedImages = 0;
+
+  for (let i = 0; i < imagesToDownload.length; i++) {
+    const imageUrl = imagesToDownload[i];
+    const ext = imageUrl.split('.').pop() || 'jpg';
+    const filename = makeImageFilename(app.name, app.category, i + 1, `.${ext}`);
+
+    if (statusEl) statusEl.textContent = `Downloading image ${i + 1}/${totalImages}...`;
+
+    let success = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({ action: 'downloadImage', imageUrl, filename, tabId: activeTabId }, resolve);
+        });
+        if (response && response.success) {
+          success = true;
+          completedImages++;
+          break;
+        }
+      } catch (e) {
+        if (attempt === 2) console.error(`Failed to download ${filename}:`, e);
+      }
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+
+  const allSuccess = completedImages === totalImages && totalImages > 0;
+
+  if (btn) {
+    btn.disabled = false;
+    btn.style.opacity = '1';
+  }
+
+  if (allSuccess) {
+    if (btn) {
+      btn.innerHTML = '✓';
+      btn.style.color = '#4ade80';
+      btn.style.opacity = '1';
+    }
+    if (statusEl) {
+      statusEl.textContent = `✓ All ${totalImages} images downloaded`;
+      statusEl.style.color = '#4ade80';
+    }
+    failedImageApps.delete(index);
+    downloadHistory.add(historyKey);
+    appendToSheet(currentSite, app.name, app.category);
+    if (retryBtn) retryBtn.style.display = 'none';
+    return true;
+  } else {
+    if (btn) {
+      btn.innerHTML = '✗';
+      btn.style.color = '#f87171';
+      btn.style.opacity = '1';
+    }
+    if (statusEl) {
+      statusEl.textContent = `${completedImages}/${totalImages} images downloaded`;
+      statusEl.style.color = '#f87171';
+    }
+    if (retryBtn) retryBtn.style.display = 'flex';
+    failedImageApps.add(index);
+    document.getElementById('retryAll').style.display = 'block';
+    return false;
+  }
+}
+
+async function downloadAllAppsSequential(indices) {
+  const downloadAllBtn = document.getElementById('downloadAll');
+  const retryAllBtn = document.getElementById('retryAll');
+  const statusBar = document.getElementById('statusBar');
+  const [origTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const origUrl = origTab.url;
+  // Ensure we're using the correct before.click origin for navigation
+  const baseUrl = 'https://before.click';
+  const exploreUrl = `${baseUrl}/explore`;
+
+  downloadAllBtn.disabled = true;
+  statusBar.style.display = 'block';
+  statusBar.textContent = `Starting ${indices.length} apps...`;
+
+  let completedCount = 0;
+  let skippedCount = 0;
+  let errorCount = 0;
+
+  for (let i = 0; i < indices.length; i++) {
+    const index = indices[i];
+    const app = allApps[index];
+    const btn = document.querySelector(`#video-${index} .btn-download`);
+    const statusEl = document.getElementById(`status-${index}`);
+
+    const historyKey = `${app.name} - ${app.category}`;
+    if (downloadHistory.has(historyKey)) {
+      skippedCount++;
+      if (statusEl) statusEl.textContent = 'Already Downloaded (Skipped)';
+      if (btn) {
+        btn.innerHTML = '✓';
+        btn.style.color = '#4ade80';
+        btn.style.opacity = '0.7';
+      }
+      continue;
+    }
+
+    statusBar.textContent = `Processing app ${i + 1} of ${indices.length}: ${app.name} - ✓ ${completedCount} | ✗ ${errorCount} | ⏩ ${skippedCount}`;
+
+    let success = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0 && statusEl) {
+        statusEl.textContent = `Retrying (Attempt ${attempt}/2)...`;
+      }
+
+      success = await downloadSingleAppImages(app, index, btn);
+      if (success) break;
+
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    if (success) {
+      completedCount++;
+    } else {
+      errorCount++;
+    }
+
+    // Navigate back to explore page between apps and wait for load
+    if (i < indices.length - 1) {
+      await new Promise((resolve) => {
+        chrome.tabs.update(activeTabId, { url: exploreUrl }, () => {
+          // Wait for the explore page to load
+          setTimeout(resolve, 2000);
+        });
+      });
+    }
+  }
+
+  // Return to original page when done
+  await new Promise((resolve) => {
+    chrome.tabs.update(activeTabId, { url: origUrl }, () => {
+      setTimeout(resolve, 1500);
+    });
+  });
+
+  downloadAllBtn.disabled = false;
+  downloadAllBtn.textContent = `Download All (${allApps.length} apps)`;
+  statusBar.innerHTML = `Batch Complete: ✓ ${completedCount} done | ⏩ ${skippedCount} skipped | ✗ ${errorCount} failed.`;
+
+  if (failedImageApps.size > 0) {
     retryAllBtn.style.display = 'block';
   } else {
     retryAllBtn.style.display = 'none';
