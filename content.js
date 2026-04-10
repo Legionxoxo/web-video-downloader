@@ -44,6 +44,7 @@ function extractVideos() {
       // Extract app info from URL: /explore?app=tolan
       const urlParams = new URLSearchParams(window.location.search);
       const appSlug = urlParams.get('app') || 'unknown';
+      const tab = urlParams.get('tab') || urlParams.get('view') || '';
 
       // Get app name and category from the page
       let appName = appSlug.charAt(0).toUpperCase() + appSlug.slice(1);
@@ -98,6 +99,7 @@ function extractVideos() {
             slug: appSlug,
             name: appName,
             category: category,
+            tab: tab,
             images: uniqueImages
           }]
         };
@@ -109,6 +111,8 @@ function extractVideos() {
   const appCards = document.querySelectorAll('a.group.block[href*="/explore?app="]');
   const seenApps = new Set();
   const apps = [];
+  const exploreUrlParams = new URLSearchParams(window.location.search);
+  const exploreTab = exploreUrlParams.get('tab') || exploreUrlParams.get('view') || '';
 
   appCards.forEach(card => {
     const href = card.getAttribute('href');
@@ -156,12 +160,14 @@ function extractVideos() {
     });
 
     if (imageUrls.length > 0) {
+      const galleryTabParam = exploreTab ? `&tab=${exploreTab}` : '';
       apps.push({
         slug: appSlug,
         name: appName,
         category: category,
+        tab: exploreTab,
         images: imageUrls,
-        galleryUrl: `${window.location.origin}/explore?app=${appSlug}`
+        galleryUrl: `${window.location.origin}/explore?app=${appSlug}${galleryTabParam}`
       });
     }
   });
@@ -316,6 +322,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     };
     xhr.send();
     return true; // Will respond asynchronously
+  } else if (request.action === 'clickTabButton') {
+    // Click the tab button with matching text
+    const { buttonText } = request;
+    const buttons = document.querySelectorAll('nav button');
+    let clicked = false;
+    buttons.forEach(btn => {
+      if (btn.textContent.trim() === buttonText) {
+        btn.click();
+        clicked = true;
+      }
+    });
+    sendResponse({ success: clicked });
   }
   return true;
 });

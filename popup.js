@@ -44,7 +44,7 @@ async function syncFromSheet(site) {
 }
 
 // Append a new entry to Google Sheet after successful download
-async function appendToSheet(site, title, company) {
+async function appendToSheet(site, title, company, uniqueId = '', tab = '') {
   if (!site) return;
 
   try {
@@ -54,10 +54,11 @@ async function appendToSheet(site, title, company) {
       body: JSON.stringify({
         site,
         content_type: site === 'before' ? 'image' : 'video',
-        unique_id: '',
+        unique_id: uniqueId, // used as 'aso' for before.click apps
         title,
         creator: company,
         url: '',
+        tab: tab, // 'onboarding' or 'paywalls' for before.click
         downloadedAt: new Date().toISOString()
       })
     });
@@ -159,7 +160,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           item.className = 'video-item';
           item.id = `video-${index}`;
 
-          const historyKey = `${app.name} - ${app.category}`;
+          const tabForHistory = app.tab === 'paywalls' ? 'paywall' : (app.tab || 'aso');
+          const historyKey = `${app.name} - ${tabForHistory}`;
           const isDownloaded = downloadHistory.has(historyKey);
           const thumb = app.images[0] || '';
 
@@ -508,9 +510,20 @@ async function downloadAllSequential(indices) {
 // ===== BEFORE.CLICK IMAGE DOWNLOAD FUNCTIONS =====
 
 // Navigate to an app gallery page and extract all images
-async function getAppGalleryImages(appSlug) {
-  // Use the actual before.click origin, not the extension's origin
-  const galleryUrl = `https://before.click/explore?app=${appSlug}`;
+async function getAppGalleryImages(appSlug, tab = '') {
+  // Normalize tab values (some URLs use plural like 'paywalls')
+  const normalizedTab = tab === 'paywalls' ? 'paywall' : tab;
+  const tabParam = normalizedTab ? `&tab=${normalizedTab}` : '';
+  const galleryUrl = `https://before.click/explore?app=${appSlug}${tabParam}`;
+
+  // Map tab value to button text (normalize plural to singular for matching)
+  const tabButtonMap = {
+    'aso': 'ASO Images',
+    'onboarding': 'Onboarding (NUX)',
+    'paywall': 'Paywall',
+    'paywalls': 'Paywall'
+  };
+  const buttonText = tabButtonMap[tab] || '';
 
   return new Promise((resolve) => {
     chrome.tabs.update(activeTabId, { url: galleryUrl }, async (tab) => {
@@ -522,6 +535,22 @@ async function getAppGalleryImages(appSlug) {
 
       // Wait for tab to finish loading
       await new Promise(r => setTimeout(r, 2500));
+
+      // If we have a tab to select, click the corresponding button
+      if (buttonText) {
+        try {
+          const clicked = await chrome.tabs.sendMessage(activeTabId, {
+            action: 'clickTabButton',
+            buttonText: buttonText
+          });
+          if (clicked) {
+            // Wait for images to load after clicking tab
+            await new Promise(r => setTimeout(r, 1500));
+          }
+        } catch (e) {
+          console.error('Failed to click tab button:', e);
+        }
+      }
 
       // Retry sending message a few times in case content script hasn't injected yet
       let retries = 5;
@@ -538,7 +567,12 @@ async function getAppGalleryImages(appSlug) {
       }
 
       if (result && result.site === 'before' && result.apps && result.apps.length > 0) {
-        resolve(result.apps[0]);
+        const galleryApp = result.apps[0];
+        // Fallback: use the tab we passed in if not set
+        if (!galleryApp.tab && tab) {
+          galleryApp.tab = tab;
+        }
+        resolve(galleryApp);
       } else {
         resolve(null);
       }
@@ -547,7 +581,9 @@ async function getAppGalleryImages(appSlug) {
 }
 
 async function downloadSingleAppImages(app, index, btn) {
-  const historyKey = `${app.name} - ${app.category}`;
+  // Normalize tab values (plural to singular)
+  const normalizeTab = (t) => t === 'paywalls' ? 'paywall' : (t || 'aso');
+  const historyKey = `${app.name} - ${normalizeTab(app.tab)}`;
 
   if (downloadHistory.has(historyKey)) {
     if (btn) {
@@ -575,12 +611,15 @@ async function downloadSingleAppImages(app, index, btn) {
 
   // Check if we're on the gallery page (has all 8 images) or explore page (has only 3 previews)
   let imagesToDownload = app.images;
+  let tabToSend = normalizeTab(app.tab);
   if (!app.galleryUrl || app.images.length < 8) {
     // Navigate to gallery page to get all images
     if (statusEl) statusEl.textContent = 'Opening gallery...';
-    const galleryApp = await getAppGalleryImages(app.slug);
+    const galleryApp = await getAppGalleryImages(app.slug, normalizeTab(app.tab));
     if (galleryApp) {
       imagesToDownload = galleryApp.images;
+      // Use tab from gallery URL (extracted from ?view= param)
+      tabToSend = normalizeTab(galleryApp.tab) || tabToSend;
     }
   }
 
@@ -631,7 +670,7 @@ async function downloadSingleAppImages(app, index, btn) {
     }
     failedImageApps.delete(index);
     downloadHistory.add(historyKey);
-    appendToSheet(currentSite, app.name, app.category);
+    appendToSheet(currentSite, app.name, tabToSend, app.slug || '', '');
     if (retryBtn) retryBtn.style.display = 'none';
     return true;
   } else {
@@ -675,7 +714,8 @@ async function downloadAllAppsSequential(indices) {
     const btn = document.querySelector(`#video-${index} .btn-download`);
     const statusEl = document.getElementById(`status-${index}`);
 
-    const historyKey = `${app.name} - ${app.category}`;
+    const appTabForHistory = app.tab === 'paywalls' ? 'paywall' : (app.tab || 'aso');
+    const historyKey = `${app.name} - ${appTabForHistory}`;
     if (downloadHistory.has(historyKey)) {
       skippedCount++;
       if (statusEl) statusEl.textContent = 'Already Downloaded (Skipped)';
